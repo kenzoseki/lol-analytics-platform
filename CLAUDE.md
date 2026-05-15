@@ -33,7 +33,7 @@ Guia para o Claude Code ao trabalhar neste repositório.
 - **Dashboard:** Databricks SQL native (não introduzir Streamlit/Metabase ainda)
 - **Testing:** `pytest` + `pytest-asyncio` (auto mode) + `respx` (httpx mocking) + `chispa` (PySpark assertions)
 - **Lint/format:** `ruff` (substitui black + flake8 + isort)
-- **Type checking:** `mypy` (strict mode no `pyproject.toml`, `continue-on-error` no CI inicialmente)
+- **Type checking:** `mypy` (strict mode no `pyproject.toml`, **enforçado no CI sem `continue-on-error`**)
 
 ---
 
@@ -42,13 +42,14 @@ Guia para o Claude Code ao trabalhar neste repositório.
 Adote estas práticas em todo DDL e código novo. Justificam-se pela documentação oficial atual da Databricks e demonstram conhecimento de plataforma além do básico.
 
 - **Unity Catalog three-level namespacing:** sempre `catalog.schema.table` (e.g. `lol_analytics.bronze.raw_matches`). Nunca usar `hive_metastore` ou tabelas no default schema.
-- **Liquid Clustering em vez de `PARTITIONED BY`:** chaves de cluster são flexíveis (podem mudar sem reescrita), compatíveis com padrões de acesso variados, e oficialmente recomendadas para novas tabelas. Não misturar `CLUSTER BY` com `PARTITIONED BY` ou `ZORDER` — são mutuamente exclusivos.
+- **Liquid Clustering em vez de `PARTITIONED BY`:** chaves de cluster são flexíveis (podem mudar sem reescrita), compatíveis com padrões de acesso variados, e oficialmente recomendadas para novas tabelas. Não misturar `CLUSTER BY` com `PARTITIONED BY` ou `ZORDER` — são mutuamente exclusivos. **Escolha de chaves:** ao contrário de partitioning, Liquid Clustering foi desenhada para se beneficiar de colunas de alta cardinalidade quando são alvo frequente de filtros/MERGE (ver doc Databricks). Para tabelas novas, considerar `CLUSTER BY AUTO` (deixar a Databricks escolher com base em padrões de query) quando disponível.
 - **Column Mapping em modo `name`:** habilita rename/drop de colunas sem reescrita de arquivos e suporta caracteres especiais. Requer `delta.minReaderVersion = 2` e `delta.minWriterVersion = 5`.
 - **Deletion Vectors (`delta.enableDeletionVectors = 'true'`):** acelera MERGE/UPDATE/DELETE drasticamente. Como Bronze depende de MERGE INTO para idempotência, é essencial.
 - **Change Data Feed (`delta.enableChangeDataFeed = 'true'`):** habilita consumo incremental — Silver vai ler apenas as linhas novas/alteradas do Bronze em vez de full scan.
 - **Generated columns:** derivar `ingestion_date` (e similares) de `ingestion_timestamp` via `GENERATED ALWAYS AS (CAST(ingestion_timestamp AS DATE))`. Evita populá-las manualmente e elimina classe inteira de bugs.
 - **Predictive Optimization:** ativar no catálogo via `ALTER CATALOG lol_analytics ENABLE PREDICTIVE OPTIMIZATION`. Substitui ajuste manual de `OPTIMIZE` / `VACUUM` e dispensa as flags `autoOptimize.optimizeWrite` / `autoOptimize.autoCompact` em managed tables sob Unity Catalog.
-- **Managed tables, não external:** confiar no Unity Catalog para localização física. Evita `LOCATION '...'` em DDL.
+- **Managed tables por padrão:** confiar no Unity Catalog para localização física quando possível. Evitar `LOCATION '...'` em DDL. **Caveat Free Edition:** validar antes do Sprint 2 que managed tables funcionam no workspace; caso contrário, documentar o fallback (external tables com path em DBFS) em ADR específico.
+- **Cost-aware compute:** jobs agendados rodam em job clusters (não all-purpose). Single-node SKU onde possível. Documentar trade-off de custo em qualquer mudança que afete cluster size, runtime ou frequência de jobs.
 
 ---
 
@@ -80,7 +81,7 @@ uv run ruff format src tests                 # format
 
 ### Type check
 ```bash
-uv run mypy src                              # strict mode; passa zero erros hoje
+uv run mypy src                              # strict mode; passa zero erros e CI enforça
 ```
 
 ### Run modules
@@ -142,6 +143,8 @@ tests/
 docs/
 ├── architecture.md      # diagrama de sistema + narrativa
 ├── data_dictionary.md   # toda tabela, toda coluna, todo grão
+├── setup/               # runbooks de provisionamento
+│   └── databricks_workspace.md   # passos para ativar UC, Predictive Opt, etc.
 └── adr/                 # Architecture Decision Records numerados
 ```
 
@@ -177,6 +180,7 @@ docs/
 - Testes devem ser determinísticos. Sem chamadas reais de rede — usar `respx` para httpx, mocks para Spark.
 - Usar fixtures pytest (em `conftest.py`) para setup compartilhado. Não repetir lógica de construção.
 - Testes async: graças a `asyncio_mode = "auto"`, não é necessário `@pytest.mark.asyncio` em todo teste.
+- **Validação contra Databricks real é parte do "Definition of Done" de cada sprint que toca Delta.** Mocks são necessários mas não suficientes — MERGE, CDF, Liquid Clustering só se validam no workspace de verdade. Antes de marcar um sprint como concluído, rodar a ingestion/transformação contra um dataset pequeno (50-100 partidas) no Free Edition.
 
 ### SQL
 - Arquivos DDL em `sql/ddl/` são numerados por camada: `01_bronze.sql`, `02_silver.sql`, `03_gold.sql`.
@@ -227,6 +231,35 @@ Ao desenvolver transforms Silver/Gold localmente (sem Databricks):
 - Usar fixture session-scoped (será adicionada na Sprint 3) pra evitar spin-up de Spark por teste.
 - Java 17 deve estar instalado no host. Windows: `winget install Microsoft.OpenJDK.17`. macOS: `brew install openjdk@17`. Ubuntu: `apt install openjdk-17-jdk`.
 - `chispa` é a biblioteca de assertion PySpark. Usar `assert_df_equality(actual, expected)` em vez de checks linha a linha.
+- **Limitação importante:** PySpark local **não** executa MERGE, CDF, Liquid Clustering ou Predictive Optimization de forma idêntica ao Databricks Runtime. Use local para lógica de transformação pura; validação dessas features requer Databricks Free Edition.
+
+---
+
+## Setup e Validação Databricks (uma vez por workspace)
+
+Antes do primeiro sprint que toca Delta de verdade (Sprint 2), executar uma vez no workspace:
+
+```sql
+-- 1. Criar catálogo
+CREATE CATALOG IF NOT EXISTS lol_analytics;
+USE CATALOG lol_analytics;
+
+-- 2. Criar schemas das três camadas
+CREATE SCHEMA IF NOT EXISTS bronze;
+CREATE SCHEMA IF NOT EXISTS silver;
+CREATE SCHEMA IF NOT EXISTS gold;
+
+-- 3. Ativar Predictive Optimization (substitui OPTIMIZE/VACUUM manuais)
+ALTER CATALOG lol_analytics ENABLE PREDICTIVE OPTIMIZATION;
+```
+
+Documentar o procedimento completo em `docs/setup/databricks_workspace.md`. Inclui validação de:
+- Managed tables criáveis em UC (vs precisar de external com LOCATION)
+- Liquid Clustering aceito no DDL atual do workspace
+- Deletion Vectors habilitáveis
+- Change Data Feed funcional (escrever, alterar, ler com `table_changes()`)
+
+Se alguma feature não estiver disponível no Free Edition, abrir ADR documentando o fallback escolhido.
 
 ---
 
@@ -235,12 +268,13 @@ Ao desenvolver transforms Silver/Gold localmente (sem Databricks):
 - Adicionar testes ao adicionar código
 - Rodar `uv run ruff check --fix` e `uv run ruff format` antes de declarar uma mudança como pronta
 - Rodar `uv run pytest --no-cov` antes de declarar uma mudança como pronta
-- Rodar `uv run mypy src` antes de declarar uma mudança como pronta (strict mode passa zero erros hoje — manter assim)
+- Rodar `uv run mypy src` antes de declarar uma mudança como pronta (strict mode passa zero erros — manter assim)
 - Atualizar `docs/data_dictionary.md` ao adicionar/modificar tabelas
 - Atualizar os checkboxes de Roadmap do README ao completar um entregável de sprint
 - Usar utilidades existentes (`get_logger`, `get_settings`, `RiotRateLimiter`) em vez de reimplementar
 - Escrever mensagens de commit em formato Conventional Commits (em inglês)
 - Em DDL novo, seguir as práticas modernas Databricks: Liquid Clustering, column mapping, deletion vectors, change data feed, generated columns, Unity Catalog three-level namespacing
+- Em qualquer mudança que afete compute (cluster, runtime, frequência), declarar explicitamente o impacto de custo estimado no PR/commit
 
 ## O Que o Claude Code Deve Perguntar Antes de Fazer
 
@@ -250,6 +284,7 @@ Ao desenvolver transforms Silver/Gold localmente (sem Databricks):
 - Mexer na lógica do rate limiter — frágil e bem testada, mudanças precisam de justificativa
 - Implementar qualquer coisa no escopo da Fase 2 antes da Fase 1 estar entregue
 - Introduzir um novo framework (e.g., dbt, Airflow, Streamlit) — esses são non-goals explícitos por enquanto
+- Iniciar um sprint novo sem validar o sprint anterior contra Databricks real
 
 ## O Que o Claude Code Nunca Deve Fazer
 
@@ -261,14 +296,31 @@ Ao desenvolver transforms Silver/Gold localmente (sem Databricks):
 - Gerar dados sintéticos/fake de partidas sem um comentário claro `# fixture: synthetic data`. Dados realistas mas falsos já confundiram análises reais.
 - Fazer push direto para `main` sem um run de CI passando.
 - Usar `PARTITIONED BY` em tabelas Delta novas — usar `CLUSTER BY` (Liquid Clustering). Mistura entre os dois é proibida pelo Delta.
+- Marcar sprint como concluído sem validação contra Databricks real quando o sprint toca Delta/Spark.
+
+---
+
+## Definition of Done (por sprint)
+
+Um sprint só é marcado como `[x]` no roadmap quando **todos** os critérios abaixo são atendidos:
+
+1. Código implementado, testado e revisado
+2. Testes unitários passando (`uv run pytest --no-cov`)
+3. mypy strict sem erros (`uv run mypy src`)
+4. Ruff lint e format limpos
+5. CI verde no GitHub
+6. Documentação atualizada (data_dictionary, ADRs novos se aplicável, README roadmap)
+7. **Para sprints que tocam Delta/Spark:** validação contra Databricks Free Edition real com dataset pequeno (50-100 partidas), evidência registrada como screenshot ou log em `docs/sprint-N-validation.md`
+
+O passo 7 é o que separa "código que parece funcionar" de "código que funciona".
 
 ---
 
 ## Roadmap de Sprints (rastrear progresso aqui)
 
 - [x] **Sprint 1: Foundation** — scaffolding do repo, Riot API client com rate limiter, Bronze DDL (com práticas Databricks modernas), smoke test, CLI, CI, docs/architecture.md + docs/data_dictionary.md, mypy strict passando
-- [ ] **Sprint 2: Robust Bronze** — ingestion incremental com MERGE, eventos de timeline, dead-letter queue, logs estruturados de ingestion em Delta, populate de `payload_hash`
-- [ ] **Sprint 3: Silver** — modelo dimensional, SCD2 em dim_champion, framework de data quality, ADR 002 + ADR 003
+- [ ] **Sprint 2: Robust Bronze** — ingestion incremental com MERGE, eventos de timeline, dead-letter queue, logs estruturados de ingestion em Delta, populate de `payload_hash`. **Status atual:** primitives (payload_hash, dead_letter, ingestion_log) implementadas e testadas; falta RiotApiClient refactor, BronzeWriter PySpark, 3 runners, CLI commands, testes PySpark, e validação contra Databricks real (ver Definition of Done item 7).
+- [ ] **Sprint 3: Silver** — modelo dimensional, SCD2 em dim_champion, framework de data quality, ADR 002 + ADR 003. **Bloqueado por:** conclusão e validação do Sprint 2.
 - [ ] **Sprint 4: Gold + Analyses** — agregações de negócio, Liquid Clustering, as 10 queries SQL com comentário de negócio
 - [ ] **Sprint 5: Dashboard + Workflow** — Databricks SQL dashboard, scheduled job, monitoring/alerting básico
 - [ ] **Sprint 6: Polish** — README com insights e charts, demo video, hardening de CI, post LinkedIn
@@ -282,10 +334,10 @@ Ao iniciar um novo sprint, ler a seção relevante deste arquivo, os ADRs mais r
 
 (Atualizar esta seção conforme issues surgem.)
 
-- A coluna `payload_hash` no Bronze está declarada mas o código de ingestion (Sprint 1) ainda não popula — adicionado na Sprint 2.
+- A coluna `payload_hash` no Bronze está declarada mas o código de ingestion (Sprint 1) ainda não popula — adicionado na Sprint 2 (a validar contra dados reais).
 - Sem testes de integration contra uma Riot API real (sandboxed) — confiando em mocks `respx`. Aceitável para Fase 1.
-- `mypy --strict` passa sem erros hoje (era warn-only). CI continua com `continue-on-error` por margem de manobra durante Sprint 2; quando estabilizar, remover `continue-on-error` para falhar CI em erros de tipo.
-- `Predictive Optimization` precisa ser ativado uma vez no catálogo (`ALTER CATALOG lol_analytics ENABLE PREDICTIVE OPTIMIZATION`) ao provisionar o workspace. Documentar no setup runbook (Sprint 5).
+- `mypy --strict` passa zero erros e o CI agora enforça (sem `continue-on-error`).
+- Validação Sprint 2 contra Databricks real pendente — bloqueia Sprint 3.
 
 ---
 
