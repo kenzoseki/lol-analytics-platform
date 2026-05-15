@@ -6,8 +6,10 @@ not at the moment a missing variable is read deep in some pipeline run.
 
 from __future__ import annotations
 
-from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Annotated
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -30,8 +32,8 @@ class Settings(BaseSettings):
     # ---- Routing ----
     # Platforms are per-region shards used by summoner-v4, league-v4, etc.
     # Regions are super-regions used by match-v5 (americas/europe/asia/sea).
-    lol_platforms: list[str] = Field(default=["BR1", "KR"])
-    lol_regions: list[str] = Field(default=["AMERICAS", "ASIA"])
+    lol_platforms: Annotated[list[str], NoDecode] = Field(default=["BR1", "KR"])
+    lol_regions: Annotated[list[str], NoDecode] = Field(default=["AMERICAS", "ASIA"])
 
     # ---- Rate limiting (development key defaults) ----
     # Riot enforces TWO concurrent windows: per-second AND per-2min.
@@ -46,6 +48,23 @@ class Settings(BaseSettings):
 
     # ---- Observability ----
     log_level: str = "INFO"
+
+    @field_validator("lol_platforms", "lol_regions", mode="before")
+    @classmethod
+    def _split_csv(cls, value: object) -> object:
+        """Accept comma-separated env values (e.g. `LOL_PLATFORMS=BR1,KR`).
+
+        Pydantic-settings tries to decode list fields as JSON, which
+        breaks the conventional CSV-in-dotenv style. We intercept
+        strings and split them; lists pass through untouched so
+        Python/JSON callers still work. Strips inline `#` comments
+        for tolerance to `.env` files that document values inline.
+        """
+        if isinstance(value, str):
+            if "#" in value:
+                value = value.split("#", 1)[0]
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
 
 
 def get_settings() -> Settings:

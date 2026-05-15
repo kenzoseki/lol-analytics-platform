@@ -22,6 +22,17 @@ app = typer.Typer(
 )
 
 
+@app.callback()
+def _root() -> None:
+    """Force multi-command mode so single-command setups don't collapse.
+
+    Typer auto-flattens a Typer app with exactly one command into a
+    single-command CLI, which would make `lol-ingest smoke-test` reject
+    `smoke-test` as an unexpected argument. Registering a no-op callback
+    keeps the subcommand structure stable as more commands land.
+    """
+
+
 @app.command("smoke-test")
 def smoke_test() -> None:
     """Validate API key, rate limiter, and routing against the live Riot API.
