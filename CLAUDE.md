@@ -42,7 +42,7 @@ Guia para o Claude Code ao trabalhar neste repositório.
 Adote estas práticas em todo DDL e código novo. Justificam-se pela documentação oficial atual da Databricks e demonstram conhecimento de plataforma além do básico.
 
 - **Unity Catalog three-level namespacing:** sempre `catalog.schema.table` (e.g. `lol_analytics.bronze.raw_matches`). Nunca usar `hive_metastore` ou tabelas no default schema.
-- **Liquid Clustering em vez de `PARTITIONED BY`:** chaves de cluster são flexíveis (podem mudar sem reescrita), compatíveis com padrões de acesso variados, e oficialmente recomendadas para novas tabelas. Não misturar `CLUSTER BY` com `PARTITIONED BY` ou `ZORDER` — são mutuamente exclusivos. **Escolha de chaves:** ao contrário de partitioning, Liquid Clustering foi desenhada para se beneficiar de colunas de alta cardinalidade quando são alvo frequente de filtros/MERGE (ver doc Databricks). Para tabelas novas, considerar `CLUSTER BY AUTO` (deixar a Databricks escolher com base em padrões de query) quando disponível.
+- **Liquid Clustering em vez de `PARTITIONED BY`:** chaves de cluster são flexíveis (podem mudar sem reescrita), self-tuning, skew-resistant, e oficialmente recomendadas para novas tabelas. Não misturar `CLUSTER BY` com `PARTITIONED BY` ou `ZORDER` — são mutuamente exclusivos.
 - **Column Mapping em modo `name`:** habilita rename/drop de colunas sem reescrita de arquivos e suporta caracteres especiais. Requer `delta.minReaderVersion = 2` e `delta.minWriterVersion = 5`.
 - **Deletion Vectors (`delta.enableDeletionVectors = 'true'`):** acelera MERGE/UPDATE/DELETE drasticamente. Como Bronze depende de MERGE INTO para idempotência, é essencial.
 - **Change Data Feed (`delta.enableChangeDataFeed = 'true'`):** habilita consumo incremental — Silver vai ler apenas as linhas novas/alteradas do Bronze em vez de full scan.
@@ -50,6 +50,29 @@ Adote estas práticas em todo DDL e código novo. Justificam-se pela documentaç
 - **Predictive Optimization:** ativar no catálogo via `ALTER CATALOG lol_analytics ENABLE PREDICTIVE OPTIMIZATION`. Substitui ajuste manual de `OPTIMIZE` / `VACUUM` e dispensa as flags `autoOptimize.optimizeWrite` / `autoOptimize.autoCompact` em managed tables sob Unity Catalog.
 - **Managed tables por padrão:** confiar no Unity Catalog para localização física quando possível. Evitar `LOCATION '...'` em DDL. **Caveat Free Edition:** validar antes do Sprint 2 que managed tables funcionam no workspace; caso contrário, documentar o fallback (external tables com path em DBFS) em ADR específico.
 - **Cost-aware compute:** jobs agendados rodam em job clusters (não all-purpose). Single-node SKU onde possível. Documentar trade-off de custo em qualquer mudança que afete cluster size, runtime ou frequência de jobs.
+
+### Escolha de Clustering Keys (Liquid Clustering)
+
+Liquid Clustering foi **explicitamente desenhado para resolver as limitações de Hive partitioning + Z-Order**. A intuição antiga de "evitar high-cardinality em chaves de organização física" **não se aplica** a Liquid Clustering — segundo a docs oficial e o anúncio de GA, chaves podem ser escolhidas puramente por padrão de acesso de query, sem se preocupar com cardinality, ordem das chaves, tamanho de arquivo ou data skew.
+
+Fontes:
+- [Use liquid clustering for tables — Databricks docs](https://docs.databricks.com/aws/en/delta/clustering)
+- [Announcing GA of Liquid Clustering — Databricks blog](https://www.databricks.com/blog/announcing-general-availability-liquid-clustering)
+
+**Regras práticas para escolher chaves:**
+
+- **Priorize frequência de filtro/join sobre cardinality.** Se uma coluna é usada frequentemente em `WHERE`, `JOIN`, ou agregação, ela é candidata. Se nunca é usada, não clusterize por ela (o custo de OPTIMIZE recorrente não compensa).
+- **Limite de 4 chaves** por tabela. Em tabelas <10TB, mais chaves degradam queries que filtram por uma coluna só.
+- **Colunas correlacionadas:** se duas colunas são altamente correlacionadas (e.g. `region` e `platform`), inclua apenas uma.
+- **High-cardinality é OK** (e.g. timestamps, IDs sequenciais como `match_id` da Riot). Liquid Clustering usa range-based segmentation lexicográfica e produz arquivos de tamanho consistente automaticamente.
+- **Caveat — UUIDs puramente aleatórios (v4):** são caso degenerado porque não têm proximidade temporal/lógica. Liquid Clustering "espalha" updates entre muitos arquivos. Se o ID tem componente sequencial (UUIDv7, IDs incrementais, IDs da Riot tipo `BR1_2987654321`), funciona bem.
+- **`CLUSTER BY AUTO` em Runtime 15.4 LTS+** com Predictive Optimization: o próprio Databricks escolhe as chaves baseado em padrões de query reais. Considerar para tabelas Gold quando padrões de uso estabilizarem (Sprint 5+).
+- **Chaves devem ser colunas com statistics coletadas** (primeiras 32 colunas do schema por padrão).
+
+**Exemplos no projeto:**
+- Bronze `raw_matches`: `CLUSTER BY (ingestion_date, match_id)` — `ingestion_date` para queries temporais, `match_id` para lookup pontual em debug. `match_id` da Riot é semi-sequencial, então cai no sweet spot.
+- Silver `fact_match_participant`: `CLUSTER BY (patch_version, region, champion_id)` — exatamente as dimensões filtradas pelo Gold.
+- Gold `agg_champion_patch_elo`: `CLUSTER BY (patch_version, region, elo_tier)` — dimensões dos dashboards.
 
 ---
 
@@ -275,6 +298,7 @@ Se alguma feature não estiver disponível no Free Edition, abrir ADR documentan
 - Escrever mensagens de commit em formato Conventional Commits (em inglês)
 - Em DDL novo, seguir as práticas modernas Databricks: Liquid Clustering, column mapping, deletion vectors, change data feed, generated columns, Unity Catalog three-level namespacing
 - Em qualquer mudança que afete compute (cluster, runtime, frequência), declarar explicitamente o impacto de custo estimado no PR/commit
+- Citar a documentação oficial (URL) ao tomar decisões sobre features de plataforma (Delta, Databricks, Riot API). Heurística genérica é insuficiente para decisões arquiteturais.
 
 ## O Que o Claude Code Deve Perguntar Antes de Fazer
 
@@ -297,6 +321,7 @@ Se alguma feature não estiver disponível no Free Edition, abrir ADR documentan
 - Fazer push direto para `main` sem um run de CI passando.
 - Usar `PARTITIONED BY` em tabelas Delta novas — usar `CLUSTER BY` (Liquid Clustering). Mistura entre os dois é proibida pelo Delta.
 - Marcar sprint como concluído sem validação contra Databricks real quando o sprint toca Delta/Spark.
+- Aplicar intuição de "evitar high-cardinality em chave de organização física" a Liquid Clustering — essa heurística vem de Hive/Z-Order e **não se aplica**. Liquid Clustering foi desenhado para resolver exatamente esse problema. Ver seção "Escolha de Clustering Keys".
 
 ---
 
@@ -319,8 +344,8 @@ O passo 7 é o que separa "código que parece funcionar" de "código que funcion
 ## Roadmap de Sprints (rastrear progresso aqui)
 
 - [x] **Sprint 1: Foundation** — scaffolding do repo, Riot API client com rate limiter, Bronze DDL (com práticas Databricks modernas), smoke test, CLI, CI, docs/architecture.md + docs/data_dictionary.md, mypy strict passando
-- [ ] **Sprint 2: Robust Bronze** — ingestion incremental com MERGE, eventos de timeline, dead-letter queue, logs estruturados de ingestion em Delta, populate de `payload_hash`. **Status atual:** primitives (payload_hash, dead_letter, ingestion_log) implementadas e testadas; falta RiotApiClient refactor, BronzeWriter PySpark, 3 runners, CLI commands, testes PySpark, e validação contra Databricks real (ver Definition of Done item 7).
-- [ ] **Sprint 3: Silver** — modelo dimensional, SCD2 em dim_champion, framework de data quality, ADR 002 + ADR 003. **Bloqueado por:** conclusão e validação do Sprint 2.
+- [ ] **Sprint 2: Robust Bronze** — ingestion incremental com MERGE, eventos de timeline, dead-letter queue, logs estruturados de ingestion em Delta, populate de `payload_hash`. **Status atual:** código implementado, falta validação contra Databricks real (ver Definition of Done item 7).
+- [ ] **Sprint 3: Silver** — modelo dimensional, SCD2 em dim_champion, framework de data quality, ADR 002 (SCD2) + ADR 003 (Clustering Strategy). **Bloqueado por:** validação do Sprint 2.
 - [ ] **Sprint 4: Gold + Analyses** — agregações de negócio, Liquid Clustering, as 10 queries SQL com comentário de negócio
 - [ ] **Sprint 5: Dashboard + Workflow** — Databricks SQL dashboard, scheduled job, monitoring/alerting básico
 - [ ] **Sprint 6: Polish** — README com insights e charts, demo video, hardening de CI, post LinkedIn
@@ -338,6 +363,7 @@ Ao iniciar um novo sprint, ler a seção relevante deste arquivo, os ADRs mais r
 - Sem testes de integration contra uma Riot API real (sandboxed) — confiando em mocks `respx`. Aceitável para Fase 1.
 - `mypy --strict` passa zero erros e o CI agora enforça (sem `continue-on-error`).
 - Validação Sprint 2 contra Databricks real pendente — bloqueia Sprint 3.
+- DDL Bronze diverge de ADR 003 em 2 chaves de cluster: `raw_league_entries` (DDL tem `(ingestion_date, tier, platform)`, ADR tem `(ingestion_date, platform)`) e `ingestion_dead_letter` (DDL tem `(failed_at_date, error_class)`, ADR tem `(failed_at_date)`). Alinhar na Sprint 2 ao revisitar DDL pra MERGE.
 
 ---
 
@@ -349,3 +375,4 @@ Ao iniciar um novo sprint, ler a seção relevante deste arquivo, os ADRs mais r
 - Preferir soluções simples e chatas a soluções clever. Este é um projeto de portfolio destinado a demonstrar engenharia sólida, não novidade.
 - O usuário (Christian Kenzo Seki) prefere ver tradeoffs e estimativas de custo *antes* da implementação, especialmente para decisões arquiteturais. Não apenas escrever código — explicar a escolha primeiro quando há mais de um caminho razoável.
 - O usuário prefere conversar em **português**; código, commits, docstrings e mensagens de log permanecem em **inglês** (convenção do repo).
+- Quando há conflito entre intuição de modelo e documentação oficial, **a documentação ganha**. Sempre busque a fonte oficial antes de afirmar com confiança sobre features de plataforma.
