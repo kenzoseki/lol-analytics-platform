@@ -167,3 +167,37 @@ TBLPROPERTIES (
     'delta.minWriterVersion'           = '5',
     'delta.enableDeletionVectors'      = 'true'
 );
+
+-- ============================================================
+-- bronze.ingestion_log
+-- ------------------------------------------------------------
+-- Eventos estruturados de cada run de ingestão. Permite responder
+-- via SQL: "quantas runs rodaram hoje?", "quantos matches o
+-- runner X processou?", "qual a taxa de duplicates skipados?".
+--
+-- Grão: uma linha por evento (started/completed/duplicate/failed)
+-- emitido por um runner. Múltiplas linhas por run_id.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS lol_analytics.bronze.ingestion_log (
+    event_id              STRING NOT NULL COMMENT 'UUID per event',
+    run_id                STRING NOT NULL COMMENT 'UUID shared across all events of a single runner invocation',
+    runner_name           STRING NOT NULL COMMENT 'e.g. match_ingestion, timeline_ingestion, league_entries_ingestion',
+    action                STRING NOT NULL COMMENT 'started | completed | inserted | skipped_duplicate | failed',
+    platform              STRING COMMENT 'Platform shard, if applicable',
+    target_table          STRING COMMENT 'Fully-qualified table written to, if applicable',
+    rows_affected         BIGINT COMMENT 'Rows inserted/updated by this event',
+    error_class           STRING COMMENT 'Exception class on failure events',
+    error_message         STRING COMMENT 'Truncated error message',
+    duration_ms           BIGINT COMMENT 'Wall-clock duration for terminal events (completed/failed)',
+    emitted_at            TIMESTAMP NOT NULL COMMENT 'UTC time the event was recorded',
+    emitted_at_date       DATE GENERATED ALWAYS AS (CAST(emitted_at AS DATE))
+)
+USING DELTA
+CLUSTER BY (emitted_at_date, runner_name)
+TBLPROPERTIES (
+    'delta.columnMapping.mode'         = 'name',
+    'delta.minReaderVersion'           = '2',
+    'delta.minWriterVersion'           = '5',
+    'delta.enableDeletionVectors'      = 'true',
+    'delta.enableChangeDataFeed'       = 'true'
+);

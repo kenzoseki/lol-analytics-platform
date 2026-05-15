@@ -164,6 +164,37 @@ quebrado no pipeline agora?" sem grepar logs.
 
 ---
 
+### `lol_analytics.bronze.ingestion_log`
+
+**Grão:** uma linha por evento estruturado emitido por um runner de
+ingestão. Vários eventos por `run_id` (uma invocação do runner).
+**Chaves de cluster:** `(emitted_at_date, runner_name)`.
+
+Tabela de observabilidade. Permite responder via SQL:
+- "Quantas runs rodaram hoje?"
+- "Qual runner está mais lento?"
+- "Quantos matches foram skipados como duplicates na última semana?"
+- "Existem failures recorrentes em algum endpoint?"
+
+| Coluna | Tipo | Nullable | Descrição |
+|---|---|---|---|
+| `event_id` | STRING | Não | UUID único por evento. |
+| `run_id` | STRING | Não | UUID compartilhado entre todos os eventos de uma invocação do runner. |
+| `runner_name` | STRING | Não | `match_ingestion`, `timeline_ingestion`, `league_entries_ingestion`. |
+| `action` | STRING | Não | `started`, `completed`, `inserted`, `skipped_duplicate`, `failed`. |
+| `platform` | STRING | Sim | Platform shard, quando aplicável. |
+| `target_table` | STRING | Sim | Tabela fully-qualified escrita, quando aplicável. |
+| `rows_affected` | BIGINT | Sim | Linhas inseridas/atualizadas pelo evento. |
+| `error_class` | STRING | Sim | Classe de exceção (preenchido em `failed`). |
+| `error_message` | STRING | Sim | Mensagem de erro truncada. |
+| `duration_ms` | BIGINT | Sim | Duração wall-clock pra eventos terminais (`completed`/`failed`). |
+| `emitted_at` | TIMESTAMP | Não | UTC do momento em que o evento foi registrado. |
+| `emitted_at_date` | DATE | Não | Gerada: `CAST(emitted_at AS DATE)`. Chave de cluster. |
+
+> Population começa na Sprint 2 com o lançamento dos runners.
+
+---
+
 ## Camada Silver
 
 **Status:** ainda não entregue (Sprint 3).
