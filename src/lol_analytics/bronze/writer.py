@@ -171,6 +171,7 @@ class BronzeWriter:
         target_table: str,
         on_condition: str,
         temp_view: str,
+        columns: list[str],
     ) -> MergeResult:
         """Run an idempotent `WHEN NOT MATCHED THEN INSERT` MERGE.
 
@@ -179,15 +180,26 @@ class BronzeWriter:
         parsing the MERGE operation metrics, and accurate because the
         writer is the only writer to these tables during a run.
 
+        The `INSERT` lists columns explicitly rather than using
+        `INSERT *`. The Bronze tables have a generated column
+        (`ingestion_date`), and `INSERT *` fails on Databricks when the
+        source DataFrame's column set does not match the target's —
+        Delta will not let you write a value into a generated column.
+        Listing the non-generated columns sidesteps that entirely.
+
         Args:
             df: Source rows.
             target_table: Fully-qualified Delta table name.
             on_condition: The `ON` predicate joining target and source,
                 using aliases `t` (target) and `s` (source).
             temp_view: Name to register `df` under for the SQL MERGE.
+            columns: The non-generated columns to insert, in order.
         """
         incoming = df.count()
         before = self.spark.table(target_table).count()
+
+        col_list = ", ".join(columns)
+        value_list = ", ".join(f"s.{c}" for c in columns)
 
         df.createOrReplaceTempView(temp_view)
         self.spark.sql(
@@ -195,7 +207,9 @@ class BronzeWriter:
             MERGE INTO {target_table} AS t
             USING {temp_view} AS s
             ON {on_condition}
-            WHEN NOT MATCHED THEN INSERT *
+            WHEN NOT MATCHED THEN
+              INSERT ({col_list})
+              VALUES ({value_list})
             """
         )
 
@@ -229,6 +243,7 @@ class BronzeWriter:
             TABLE_RAW_MATCHES,
             on_condition="t.match_id = s.match_id AND t.platform = s.platform",
             temp_view="_incoming_raw_matches",
+            columns=_MATCH_COLUMNS,
         )
 
     def upsert_timelines(self, records: list[BronzeMatchRecord]) -> MergeResult:
@@ -244,6 +259,7 @@ class BronzeWriter:
             TABLE_RAW_MATCH_TIMELINE,
             on_condition="t.match_id = s.match_id AND t.platform = s.platform",
             temp_view="_incoming_raw_match_timeline",
+            columns=_MATCH_COLUMNS,
         )
 
     def upsert_league_entries(self, records: list[BronzeLeagueEntryRecord]) -> MergeResult:
@@ -265,4 +281,5 @@ class BronzeWriter:
                 "AND t.ingestion_date = CAST(s.ingestion_timestamp AS DATE)"
             ),
             temp_view="_incoming_raw_league_entries",
+            columns=_LEAGUE_COLUMNS,
         )
