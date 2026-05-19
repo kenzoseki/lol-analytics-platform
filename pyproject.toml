@@ -76,6 +76,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S101"]      # allow assert in tests
+# typer requires typer.Option()/Argument() as call-in-default; B008 is a
+# false positive for the CLI module.
+"src/lol_analytics/ingestion/cli.py" = ["B008"]
 
 # ---------- Pytest ----------
 [tool.pytest.ini_options]
