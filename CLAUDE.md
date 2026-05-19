@@ -344,7 +344,7 @@ O passo 7 é o que separa "código que parece funcionar" de "código que funcion
 ## Roadmap de Sprints (rastrear progresso aqui)
 
 - [x] **Sprint 1: Foundation** — scaffolding do repo, Riot API client com rate limiter, Bronze DDL (com práticas Databricks modernas), smoke test, CLI, CI, docs/architecture.md + docs/data_dictionary.md, mypy strict passando. **Validado contra Databricks Free Edition em 2026-05-15** (ver `docs/sprint-1-validation.md`).
-- [ ] **Sprint 2: Robust Bronze** — ingestion incremental com MERGE, eventos de timeline, dead-letter queue, logs estruturados de ingestion em Delta, populate de `payload_hash`. **Status atual:** código implementado, falta validação contra Databricks real (ver Definition of Done item 7).
+- [ ] **Sprint 2: Robust Bronze** — ingestion incremental com MERGE, eventos de timeline, dead-letter queue, logs estruturados de ingestion em Delta, populate de `payload_hash`. **Status atual:** código completo e testado (RiotApiClient com dead-letter sink, bronze/records, BronzeWriter, Delta sinks, 3 runners, CLI commands `pull-*`, testes unitários + testes PySpark marcados); falta rodar o notebook `02_validate_ingestion.py` contra Databricks real (ver Definition of Done item 7).
 - [ ] **Sprint 3: Silver** — modelo dimensional, SCD2 em dim_champion, framework de data quality, ADR 002 (SCD2) + ADR 003 (Clustering Strategy). **Bloqueado por:** validação do Sprint 2.
 - [ ] **Sprint 4: Gold + Analyses** — agregações de negócio, Liquid Clustering, as 10 queries SQL com comentário de negócio
 - [ ] **Sprint 5: Dashboard + Workflow** — Databricks SQL dashboard, scheduled job, monitoring/alerting básico
@@ -359,8 +359,9 @@ Ao iniciar um novo sprint, ler a seção relevante deste arquivo, os ADRs mais r
 
 (Atualizar esta seção conforme issues surgem.)
 
-- A coluna `payload_hash` no Bronze está declarada mas o código de ingestion (Sprint 1) ainda não popula — adicionado na Sprint 2 (a validar contra dados reais).
+- A coluna `payload_hash` no Bronze passou a ser populada na Sprint 2 (`bronze/records.py` calcula SHA-256 sobre o JSON canônico). A validar contra dados reais via `02_validate_ingestion.py`.
 - Sem testes de integration contra uma Riot API real (sandboxed) — confiando em mocks `respx`. Aceitável para Fase 1.
+- PySpark local não roda em Windows sem `winutils.exe` (HADOOP_HOME). Decisão: testes `@pytest.mark.spark` skipam no dev local Windows e rodam no job `spark-tests` do CI (Ubuntu) e no Databricks. Lógica pura é testada sem Spark.
 - `mypy --strict` passa zero erros e o CI agora enforça (sem `continue-on-error`).
 - Sprint 1 validada contra Databricks Free Edition real em 2026-05-15 — catalog, schemas, DDL Bronze, Liquid Clustering, column mapping, deletion vectors, CDF, generated columns e MERGE idempotency confirmados (ver `docs/sprint-1-validation.md`). Infra de plataforma de-riscada para Sprint 2.
 - Validação Sprint 2 (ingestion code path com partidas reais) contra Databricks real pendente — bloqueia Sprint 3.
