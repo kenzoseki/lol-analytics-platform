@@ -343,7 +343,7 @@ O passo 7 é o que separa "código que parece funcionar" de "código que funcion
 
 ## Roadmap de Sprints (rastrear progresso aqui)
 
-- [x] **Sprint 1: Foundation** — scaffolding do repo, Riot API client com rate limiter, Bronze DDL (com práticas Databricks modernas), smoke test, CLI, CI, docs/architecture.md + docs/data_dictionary.md, mypy strict passando
+- [x] **Sprint 1: Foundation** — scaffolding do repo, Riot API client com rate limiter, Bronze DDL (com práticas Databricks modernas), smoke test, CLI, CI, docs/architecture.md + docs/data_dictionary.md, mypy strict passando. **Validado contra Databricks Free Edition em 2026-05-15** (ver `docs/sprint-1-validation.md`).
 - [ ] **Sprint 2: Robust Bronze** — ingestion incremental com MERGE, eventos de timeline, dead-letter queue, logs estruturados de ingestion em Delta, populate de `payload_hash`. **Status atual:** código implementado, falta validação contra Databricks real (ver Definition of Done item 7).
 - [ ] **Sprint 3: Silver** — modelo dimensional, SCD2 em dim_champion, framework de data quality, ADR 002 (SCD2) + ADR 003 (Clustering Strategy). **Bloqueado por:** validação do Sprint 2.
 - [ ] **Sprint 4: Gold + Analyses** — agregações de negócio, Liquid Clustering, as 10 queries SQL com comentário de negócio
@@ -362,7 +362,8 @@ Ao iniciar um novo sprint, ler a seção relevante deste arquivo, os ADRs mais r
 - A coluna `payload_hash` no Bronze está declarada mas o código de ingestion (Sprint 1) ainda não popula — adicionado na Sprint 2 (a validar contra dados reais).
 - Sem testes de integration contra uma Riot API real (sandboxed) — confiando em mocks `respx`. Aceitável para Fase 1.
 - `mypy --strict` passa zero erros e o CI agora enforça (sem `continue-on-error`).
-- Validação Sprint 2 contra Databricks real pendente — bloqueia Sprint 3.
+- Sprint 1 validada contra Databricks Free Edition real em 2026-05-15 — catalog, schemas, DDL Bronze, Liquid Clustering, column mapping, deletion vectors, CDF, generated columns e MERGE idempotency confirmados (ver `docs/sprint-1-validation.md`). Infra de plataforma de-riscada para Sprint 2.
+- Validação Sprint 2 (ingestion code path com partidas reais) contra Databricks real pendente — bloqueia Sprint 3.
 - DDL Bronze diverge de ADR 003 em 2 chaves de cluster: `raw_league_entries` (DDL tem `(ingestion_date, tier, platform)`, ADR tem `(ingestion_date, platform)`) e `ingestion_dead_letter` (DDL tem `(failed_at_date, error_class)`, ADR tem `(failed_at_date)`). Alinhar na Sprint 2 ao revisitar DDL pra MERGE.
 
 ---
