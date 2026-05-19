@@ -30,12 +30,33 @@
 # MAGIC
 # MAGIC The Git Folder gives us the source; install it (editable) so
 # MAGIC `import lol_analytics` works. `httpx`, `tenacity`, `structlog`,
-# MAGIC `pydantic-settings` come along as dependencies.
+# MAGIC `pydantic-settings`, `typer` come along as dependencies.
+# MAGIC
+# MAGIC The repo root is **auto-detected** from this notebook's own path —
+# MAGIC no need to hardcode `/Workspace/Users/<you>/...`. The detected path
+# MAGIC is exposed as `$repo_root`, which the `%pip` magic in the next cell
+# MAGIC expands (Databricks substitutes notebook-scoped Python variables
+# MAGIC into `%pip` lines).
 
 # COMMAND ----------
 
-# MAGIC %pip install -e /Workspace/Repos/$(whoami)/lol-analytics-platform
-# MAGIC # If the path differs, adjust to your Git Folder location.
+# This notebook lives at <repo_root>/notebooks/setup/02_validate_ingestion.py,
+# so the repo root is three directories up. `dbutils.notebook.entry_point`
+# is the documented way to get the running notebook's workspace path.
+_notebook_path = (
+    dbutils.notebook.entry_point.getDbutils()  # noqa: F821 — Databricks builtin
+    .notebook()
+    .getContext()
+    .notebookPath()
+    .get()
+)
+# /Workspace prefix makes it a real filesystem path the pip can install from.
+repo_root = "/Workspace" + _notebook_path.rsplit("/notebooks/", 1)[0]
+print(f"Repo root detected: {repo_root}")
+
+# COMMAND ----------
+
+# MAGIC %pip install -e $repo_root
 
 # COMMAND ----------
 
