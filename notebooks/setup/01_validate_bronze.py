@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "2"
+# ///
 # MAGIC %md
 # MAGIC # Sprint 1 Validation — Bronze layer against Databricks Free Edition
 # MAGIC
@@ -328,6 +332,7 @@
 
 # COMMAND ----------
 
+# DBTITLE 1,Cell 26
 # MAGIC %sql
 # MAGIC -- fixture: synthetic data
 # MAGIC MERGE INTO lol_analytics.bronze.raw_matches AS target
@@ -350,7 +355,9 @@
 # MAGIC ) AS source
 # MAGIC ON  target.match_id = source.match_id
 # MAGIC AND target.platform = source.platform
-# MAGIC WHEN NOT MATCHED THEN INSERT *;
+# MAGIC WHEN NOT MATCHED THEN 
+# MAGIC   INSERT (match_id, platform, region, payload, payload_hash, ingestion_timestamp, source_endpoint, api_key_hash)
+# MAGIC   VALUES (source.match_id, source.platform, source.region, source.payload, source.payload_hash, source.ingestion_timestamp, source.source_endpoint, source.api_key_hash);
 # MAGIC
 # MAGIC SELECT COUNT(*) AS test_row_count
 # MAGIC FROM lol_analytics.bronze.raw_matches
