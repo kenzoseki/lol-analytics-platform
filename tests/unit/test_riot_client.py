@@ -6,8 +6,10 @@ import httpx
 import pytest
 import respx
 
+from lol_analytics.bronze.dead_letter import InMemoryDeadLetterSink
 from lol_analytics.ingestion.rate_limiter import RiotRateLimiter
 from lol_analytics.ingestion.riot_client import (
+    MAX_ATTEMPTS,
     RiotApiClient,
     RiotApiError,
 )
@@ -114,3 +116,88 @@ class TestRiotApiClient:
 
         sent_request = route.calls[0].request
         assert sent_request.headers["X-Riot-Token"] == "RGAPI-secret-token"
+
+
+class TestDeadLetterIntegration:
+    """The client writes a dead-letter record on terminal failure when a
+    sink is configured, and behaves exactly as Sprint 1 when it is not."""
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_4xx_writes_dead_letter(self, limiter: RiotRateLimiter) -> None:
+        respx.get("https://br1.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/missing").mock(
+            return_value=httpx.Response(404, json={"status": {"message": "not found"}})
+        )
+
+        sink = InMemoryDeadLetterSink()
+        async with RiotApiClient("RGAPI-test", limiter, dead_letter_sink=sink) as client:
+            with pytest.raises(RiotApiError):
+                await client.get_summoner_by_puuid("BR1", "missing")
+
+        assert len(sink.records) == 1
+        rec = sink.records[0]
+        assert rec.endpoint == "get_summoner_by_puuid"
+        assert rec.http_status == 404
+        assert rec.error_class == "RiotApiError"
+        assert rec.attempt_count == MAX_ATTEMPTS
+        assert "missing" in rec.url
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_exhausted_retries_writes_dead_letter(self, limiter: RiotRateLimiter) -> None:
+        # 503 on every attempt — retries exhaust, terminal failure.
+        respx.get(
+            "https://br1.api.riotgames.com/lol/league/v4/masterleagues/by-queue/RANKED_SOLO_5x5"
+        ).mock(return_value=httpx.Response(503))
+
+        sink = InMemoryDeadLetterSink()
+        async with RiotApiClient("RGAPI-test", limiter, dead_letter_sink=sink) as client:
+            with pytest.raises(httpx.HTTPStatusError):
+                await client.get_master_league("BR1")
+
+        assert len(sink.records) == 1
+        assert sink.records[0].endpoint == "get_master_league"
+        assert sink.records[0].error_class == "HTTPStatusError"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_success_writes_no_dead_letter(self, limiter: RiotRateLimiter) -> None:
+        respx.get(
+            "https://br1.api.riotgames.com/lol/league/v4/challengerleagues/by-queue/RANKED_SOLO_5x5"
+        ).mock(return_value=httpx.Response(200, json={"entries": []}))
+
+        sink = InMemoryDeadLetterSink()
+        async with RiotApiClient("RGAPI-test", limiter, dead_letter_sink=sink) as client:
+            await client.get_challenger_league("BR1")
+
+        assert sink.records == []
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_no_sink_still_raises(self, limiter: RiotRateLimiter) -> None:
+        # Sprint 1 behaviour preserved: without a sink, a 4xx just raises.
+        respx.get("https://br1.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/missing").mock(
+            return_value=httpx.Response(404, json={"status": {"message": "not found"}})
+        )
+
+        async with RiotApiClient("RGAPI-test", limiter) as client:
+            with pytest.raises(RiotApiError, match="404"):
+                await client.get_summoner_by_puuid("BR1", "missing")
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_sink_failure_does_not_mask_original_error(
+        self, limiter: RiotRateLimiter
+    ) -> None:
+        # A sink that raises must not swallow or replace the API error.
+        class BrokenSink:
+            def write(self, record: object) -> None:
+                raise RuntimeError("sink is down")
+
+        respx.get("https://br1.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/missing").mock(
+            return_value=httpx.Response(404, json={"status": {"message": "not found"}})
+        )
+
+        async with RiotApiClient("RGAPI-test", limiter, dead_letter_sink=BrokenSink()) as client:
+            with pytest.raises(RiotApiError, match="404"):
+                await client.get_summoner_by_puuid("BR1", "missing")

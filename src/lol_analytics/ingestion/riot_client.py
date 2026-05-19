@@ -20,14 +20,20 @@ import httpx
 import structlog
 from tenacity import (
     AsyncRetrying,
+    RetryError,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
 
+from lol_analytics.bronze.dead_letter import DeadLetterRecord, DeadLetterSink
 from lol_analytics.ingestion.rate_limiter import RiotRateLimiter
 
 log = structlog.get_logger(__name__)
+
+# Max attempts for the retry loop. Exposed as a module constant so the
+# dead-letter record can report it without re-deriving the tenacity config.
+MAX_ATTEMPTS = 5
 
 # Map of platform shard → regional super-region for match-v5 endpoints
 PLATFORM_TO_REGION: dict[str, str] = {
@@ -62,6 +68,16 @@ class RiotRateLimitError(Exception):
         self.retry_after = retry_after
 
 
+def _status_from_message(error: RiotApiError) -> int | None:
+    """Best-effort extraction of the HTTP status from a RiotApiError.
+
+    `RiotApiError` messages are formatted `"{status} on {url}: {body}"`.
+    Returns the leading integer if present, else `None`.
+    """
+    head = str(error).split(" ", 1)[0]
+    return int(head) if head.isdigit() else None
+
+
 class RiotApiClient:
     """Async Riot API client.
 
@@ -74,9 +90,23 @@ class RiotApiClient:
         api_key: str,
         rate_limiter: RiotRateLimiter,
         timeout: float = 10.0,
+        dead_letter_sink: DeadLetterSink | None = None,
     ):
+        """Construct the client.
+
+        Args:
+            api_key: Riot API key (`RGAPI-...`).
+            rate_limiter: Shared multi-window rate limiter.
+            timeout: Per-request timeout in seconds.
+            dead_letter_sink: Optional. When provided, requests that fail
+                terminally (4xx other than 429, or transient errors that
+                exhaust all retries) are recorded here before the
+                exception propagates. When `None`, the client behaves
+                exactly as in Sprint 1 — failures simply raise.
+        """
         self.api_key = api_key
         self.rate_limiter = rate_limiter
+        self.dead_letter_sink = dead_letter_sink
         self._client = httpx.AsyncClient(
             timeout=timeout,
             headers={"X-Riot-Token": api_key},
@@ -107,7 +137,35 @@ class RiotApiClient:
 
     # ---------- Core request method ----------
 
-    async def _get(self, url: str) -> Any:
+    def _record_dead_letter(
+        self,
+        endpoint: str,
+        url: str,
+        error: BaseException,
+        http_status: int | None,
+    ) -> None:
+        """Write a dead-letter record for a terminally failed request.
+
+        No-op when no sink is configured. Never raises — losing a
+        dead-letter row must not mask the original failure.
+        """
+        if self.dead_letter_sink is None:
+            return
+        try:
+            self.dead_letter_sink.write(
+                DeadLetterRecord(
+                    endpoint=endpoint,
+                    url=url,
+                    error_class=type(error).__name__,
+                    attempt_count=MAX_ATTEMPTS,
+                    http_status=http_status,
+                    error_message=str(error)[:1000],
+                )
+            )
+        except Exception:
+            log.warning("dead_letter_write_failed", endpoint=endpoint, url=url)
+
+    async def _get(self, url: str, *, endpoint: str) -> Any:
         """Issue a rate-limited GET with retries on transient errors.
 
         Retries:
@@ -115,43 +173,70 @@ class RiotApiClient:
           - 429 (rate limit) — respects Retry-After
           - 5xx — exponential backoff
         Does NOT retry on 4xx (other than 429): bad request, not found, forbidden.
+
+        On terminal failure (4xx other than 429, or transient errors that
+        exhaust all retries) a dead-letter record is written if a sink is
+        configured, then the exception propagates unchanged.
+
+        Args:
+            url: Full request URL.
+            endpoint: Logical endpoint name (e.g. `get_match`) for the
+                dead-letter record. Keyword-only so callers can't confuse
+                it with the URL.
         """
-        async for attempt in AsyncRetrying(
-            stop=stop_after_attempt(5),
-            wait=wait_exponential(multiplier=1, min=1, max=30),
-            retry=retry_if_exception_type(
-                (httpx.TransportError, httpx.HTTPStatusError, RiotRateLimitError)
-            ),
-            reraise=True,
-        ):
-            with attempt:
-                await self.rate_limiter.acquire()
-                response = await self._client.get(url)
+        try:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(MAX_ATTEMPTS),
+                wait=wait_exponential(multiplier=1, min=1, max=30),
+                retry=retry_if_exception_type(
+                    (httpx.TransportError, httpx.HTTPStatusError, RiotRateLimitError)
+                ),
+                reraise=True,
+            ):
+                with attempt:
+                    await self.rate_limiter.acquire()
+                    response = await self._client.get(url)
 
-                if response.status_code == 429:
-                    retry_after = float(response.headers.get("Retry-After", "1"))
-                    log.warning("rate_limited", url=url, retry_after=retry_after)
-                    raise RiotRateLimitError(retry_after)
+                    if response.status_code == 429:
+                        retry_after = float(response.headers.get("Retry-After", "1"))
+                        log.warning("rate_limited", url=url, retry_after=retry_after)
+                        raise RiotRateLimitError(retry_after)
 
-                if response.status_code >= 500:
-                    log.warning(
-                        "server_error",
-                        url=url,
-                        status=response.status_code,
-                    )
-                    response.raise_for_status()  # triggers retry via tenacity
+                    if response.status_code >= 500:
+                        log.warning(
+                            "server_error",
+                            url=url,
+                            status=response.status_code,
+                        )
+                        response.raise_for_status()  # triggers retry via tenacity
 
-                if response.status_code >= 400:
-                    # 4xx other than 429 — do NOT retry, this is a client bug
-                    log.error(
-                        "client_error",
-                        url=url,
-                        status=response.status_code,
-                        body=response.text[:500],
-                    )
-                    raise RiotApiError(f"{response.status_code} on {url}: {response.text[:200]}")
+                    if response.status_code >= 400:
+                        # 4xx other than 429 — do NOT retry, this is a client bug
+                        log.error(
+                            "client_error",
+                            url=url,
+                            status=response.status_code,
+                            body=response.text[:500],
+                        )
+                        raise RiotApiError(
+                            f"{response.status_code} on {url}: {response.text[:200]}"
+                        )
 
-                return response.json()
+                    return response.json()
+        except RiotApiError as e:
+            # Non-retryable 4xx — extract the status from the message prefix.
+            self._record_dead_letter(endpoint, url, e, _status_from_message(e))
+            raise
+        except RetryError as e:
+            # All retries exhausted; tenacity wraps the last exception.
+            self._record_dead_letter(endpoint, url, e.last_attempt.exception() or e, None)
+            raise
+        except (httpx.HTTPStatusError, httpx.TransportError, RiotRateLimitError) as e:
+            # reraise=True surfaces the last exception directly (not a
+            # RetryError) when retries are exhausted.
+            status = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else None
+            self._record_dead_letter(endpoint, url, e, status)
+            raise
 
         # Unreachable but satisfies type checker
         raise RuntimeError("Retry loop exited without returning")
@@ -163,25 +248,25 @@ class RiotApiClient:
     ) -> dict[str, Any]:
         """Top ~300 players in Challenger tier on a platform."""
         url = self._platform_url(platform, f"/lol/league/v4/challengerleagues/by-queue/{queue}")
-        return cast("dict[str, Any]", await self._get(url))
+        return cast("dict[str, Any]", await self._get(url, endpoint="get_challenger_league"))
 
     async def get_grandmaster_league(
         self, platform: str, queue: str = "RANKED_SOLO_5x5"
     ) -> dict[str, Any]:
         """Top ~700 players in Grandmaster tier on a platform."""
         url = self._platform_url(platform, f"/lol/league/v4/grandmasterleagues/by-queue/{queue}")
-        return cast("dict[str, Any]", await self._get(url))
+        return cast("dict[str, Any]", await self._get(url, endpoint="get_grandmaster_league"))
 
     async def get_master_league(
         self, platform: str, queue: str = "RANKED_SOLO_5x5"
     ) -> dict[str, Any]:
         """All players in Master tier on a platform (variable size, often thousands)."""
         url = self._platform_url(platform, f"/lol/league/v4/masterleagues/by-queue/{queue}")
-        return cast("dict[str, Any]", await self._get(url))
+        return cast("dict[str, Any]", await self._get(url, endpoint="get_master_league"))
 
     async def get_summoner_by_puuid(self, platform: str, puuid: str) -> dict[str, Any]:
         url = self._platform_url(platform, f"/lol/summoner/v4/summoners/by-puuid/{puuid}")
-        return cast("dict[str, Any]", await self._get(url))
+        return cast("dict[str, Any]", await self._get(url, endpoint="get_summoner_by_puuid"))
 
     async def get_match_ids_by_puuid(
         self,
@@ -200,14 +285,14 @@ class RiotApiClient:
         params.append(f"count={count}")
         params.append(f"start={start}")
         full_url = f"{url}?{'&'.join(params)}"
-        result = await self._get(full_url)
+        result = await self._get(full_url, endpoint="get_match_ids_by_puuid")
         # API returns a JSON array directly, not an object
         return result if isinstance(result, list) else []
 
     async def get_match(self, region: str, match_id: str) -> dict[str, Any]:
         url = self._region_url(region, f"/lol/match/v5/matches/{match_id}")
-        return cast("dict[str, Any]", await self._get(url))
+        return cast("dict[str, Any]", await self._get(url, endpoint="get_match"))
 
     async def get_match_timeline(self, region: str, match_id: str) -> dict[str, Any]:
         url = self._region_url(region, f"/lol/match/v5/matches/{match_id}/timeline")
-        return cast("dict[str, Any]", await self._get(url))
+        return cast("dict[str, Any]", await self._get(url, endpoint="get_match_timeline"))
