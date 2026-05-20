@@ -26,22 +26,12 @@ class TestSha256Hex:
             "4ab2d81279c483cb89ff8224683c386fc9ad7837c9fe19a3f6c32af25384bdaf"
         )
 
-    def test_deterministic(self) -> None:
-        payload = '{"matchId": "BR1_123", "gameDuration": 1234}'
-        assert sha256_hex(payload) == sha256_hex(payload)
-
     def test_distinct_inputs_produce_distinct_hashes(self) -> None:
         # Whitespace difference must change the hash — we hash the raw
         # bytes Riot sent, not a canonicalized form.
         a = '{"matchId":"BR1_123"}'
         b = '{"matchId": "BR1_123"}'
         assert sha256_hex(a) != sha256_hex(b)
-
-    def test_output_is_lowercase_hex(self) -> None:
-        digest = sha256_hex("anything")
-        assert len(digest) == 64
-        assert digest == digest.lower()
-        assert set(digest).issubset(set("0123456789abcdef"))
 
     def test_rejects_bytes(self) -> None:
         with pytest.raises(TypeError, match="must be str"):

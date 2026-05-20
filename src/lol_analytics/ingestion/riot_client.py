@@ -14,6 +14,8 @@ We map platform → region internally so callers don't have to.
 
 from __future__ import annotations
 
+import uuid
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import httpx
@@ -26,7 +28,6 @@ from tenacity import (
     wait_exponential,
 )
 
-from lol_analytics.bronze.dead_letter import DeadLetterRecord, DeadLetterSink
 from lol_analytics.ingestion.rate_limiter import RiotRateLimiter
 
 log = structlog.get_logger(__name__)
@@ -90,7 +91,6 @@ class RiotApiClient:
         api_key: str,
         rate_limiter: RiotRateLimiter,
         timeout: float = 10.0,
-        dead_letter_sink: DeadLetterSink | None = None,
     ):
         """Construct the client.
 
@@ -98,15 +98,15 @@ class RiotApiClient:
             api_key: Riot API key (`RGAPI-...`).
             rate_limiter: Shared multi-window rate limiter.
             timeout: Per-request timeout in seconds.
-            dead_letter_sink: Optional. When provided, requests that fail
-                terminally (4xx other than 429, or transient errors that
-                exhaust all retries) are recorded here before the
-                exception propagates. When `None`, the client behaves
-                exactly as in Sprint 1 — failures simply raise.
         """
         self.api_key = api_key
         self.rate_limiter = rate_limiter
-        self.dead_letter_sink = dead_letter_sink
+        # Terminal failures (4xx other than 429, or transient errors that
+        # exhaust all retries) are appended here as plain dicts. The
+        # ingestion notebook reads this list after a run and writes the
+        # rows to `bronze.ingestion_dead_letter`. The exception still
+        # propagates — recording it here does not swallow it.
+        self.dead_letters: list[dict[str, Any]] = []
         self._client = httpx.AsyncClient(
             timeout=timeout,
             headers={"X-Riot-Token": api_key},
@@ -144,26 +144,27 @@ class RiotApiClient:
         error: BaseException,
         http_status: int | None,
     ) -> None:
-        """Write a dead-letter record for a terminally failed request.
+        """Append a dead-letter record for a terminally failed request.
 
-        No-op when no sink is configured. Never raises — losing a
-        dead-letter row must not mask the original failure.
+        The record is a plain dict whose keys match the
+        `bronze.ingestion_dead_letter` table columns, so the ingestion
+        notebook can write the accumulated list straight to Delta.
+        Recording here never raises and never swallows — the original
+        exception still propagates to the caller.
         """
-        if self.dead_letter_sink is None:
-            return
-        try:
-            self.dead_letter_sink.write(
-                DeadLetterRecord(
-                    endpoint=endpoint,
-                    url=url,
-                    error_class=type(error).__name__,
-                    attempt_count=MAX_ATTEMPTS,
-                    http_status=http_status,
-                    error_message=str(error)[:1000],
-                )
-            )
-        except Exception:
-            log.warning("dead_letter_write_failed", endpoint=endpoint, url=url)
+        self.dead_letters.append(
+            {
+                "request_id": str(uuid.uuid4()),
+                "endpoint": endpoint,
+                "url": url,
+                "http_status": http_status,
+                "error_class": type(error).__name__,
+                "error_message": str(error)[:1000],
+                "request_payload": None,
+                "attempt_count": MAX_ATTEMPTS,
+                "failed_at": datetime.now(tz=UTC),
+            }
+        )
 
     async def _get(self, url: str, *, endpoint: str) -> Any:
         """Issue a rate-limited GET with retries on transient errors.
@@ -175,8 +176,8 @@ class RiotApiClient:
         Does NOT retry on 4xx (other than 429): bad request, not found, forbidden.
 
         On terminal failure (4xx other than 429, or transient errors that
-        exhaust all retries) a dead-letter record is written if a sink is
-        configured, then the exception propagates unchanged.
+        exhaust all retries) a dead-letter dict is appended to
+        `self.dead_letters`, then the exception propagates unchanged.
 
         Args:
             url: Full request URL.

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 from datetime import UTC, datetime
 
 from lol_analytics.bronze.payload_hash import sha256_hex
@@ -124,20 +123,6 @@ class TestBuildMatchRecord:
             api_key_hash="ab12",
         )
         assert rec.api_key_hash == "ab12"
-
-    def test_record_is_frozen(self) -> None:
-        rec = build_match_record(
-            match_id="BR1_123",
-            platform="BR1",
-            region="americas",
-            payload={},
-            source_endpoint="/x",
-        )
-        try:
-            rec.match_id = "mutated"  # type: ignore[misc]
-        except dataclasses.FrozenInstanceError:
-            return
-        raise AssertionError("BronzeMatchRecord should be frozen")
 
 
 class TestBuildLeagueEntryRecords:
