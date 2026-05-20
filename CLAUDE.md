@@ -31,7 +31,7 @@ Guia para o Claude Code ao trabalhar neste repositório.
 - **Orchestration:** Databricks Workflows (não introduzir Airflow)
 - **Data quality framework:** custom lightweight checks (não puxar Great Expectations)
 - **Dashboard:** Databricks SQL native (não introduzir Streamlit/Metabase ainda)
-- **Testing:** `pytest` + `pytest-asyncio` (auto mode) + `respx` (httpx mocking) + `chispa` (PySpark assertions)
+- **Testing:** `pytest` + `pytest-asyncio` (auto mode) + `respx` (httpx mocking). Testes cobrem só lógica pura em `src/`; Spark/Delta valida-se nos notebooks Databricks (ver ADR 004).
 - **Lint/format:** `ruff` (substitui black + flake8 + isort)
 - **Type checking:** `mypy` (strict mode no `pyproject.toml`, **enforçado no CI sem `continue-on-error`**)
 
@@ -149,19 +149,23 @@ Decisões arquiteturais são documentadas como ADRs em `docs/adr/`. Sempre ler o
 ## Layout do Repositório
 
 ```
-src/lol_analytics/
-├── ingestion/      # Riot API client, rate limiter, CLI entrypoints
-├── bronze/         # transforms de landing raw
-├── silver/         # transforms do modelo dimensional
-├── gold/           # agregações de negócio
+src/lol_analytics/          # SÓ lógica pura testável — nunca importa pyspark
+├── ingestion/      # Riot API client, rate limiter, smoke test, CLI
+├── bronze/         # records (builders puros) + payload_hash
+├── silver/         # transforms do modelo dimensional (Sprint 3+)
+├── gold/           # agregações de negócio (Sprint 4+)
 └── utils/          # config, logging, helpers compartilhados
+
+notebooks/          # orquestração Databricks — é onde Spark/Delta rodam
+├── setup/          # notebooks de provisionamento/validação do workspace
+└── bronze/         # notebooks de ingestão Bronze (fetch → MERGE)
 
 sql/
 ├── ddl/            # statements CREATE TABLE (um arquivo por camada)
 └── analyses/       # as 10 queries de portfolio (Sprint 4)
 
 tests/
-└── unit/           # testes pytest, espelhando estrutura de src/
+└── unit/           # testes pytest da lógica pura, espelhando src/
 
 docs/
 ├── architecture.md      # diagrama de sistema + narrativa
@@ -244,17 +248,34 @@ docs/
 
 ---
 
-## Desenvolvimento PySpark Local
+## Databricks-first: onde cada código roda (ver ADR 004)
 
-Ao desenvolver transforms Silver/Gold localmente (sem Databricks):
+O projeto separa código em duas casas, e a regra é dura:
 
-- O extra `[spark]` em `pyproject.toml` instala PySpark + delta-spark.
-- Instalar com: `uv sync --extra dev --extra spark`
-- Testes que requerem SparkSession são marcados `@pytest.mark.spark` e excluídos por default em runs rápidos.
-- Usar fixture session-scoped (será adicionada na Sprint 3) pra evitar spin-up de Spark por teste.
-- Java 17 deve estar instalado no host. Windows: `winget install Microsoft.OpenJDK.17`. macOS: `brew install openjdk@17`. Ubuntu: `apt install openjdk-17-jdk`.
-- `chispa` é a biblioteca de assertion PySpark. Usar `assert_df_equality(actual, expected)` em vez de checks linha a linha.
-- **Limitação importante:** PySpark local **não** executa MERGE, CDF, Liquid Clustering ou Predictive Optimization de forma idêntica ao Databricks Runtime. Use local para lógica de transformação pura; validação dessas features requer Databricks Free Edition.
+- **`src/lol_analytics/`** — só **lógica pura testável**: rate limiter,
+  Riot API client, hashing, parsing/transformação de payloads. **Nunca
+  importa `pyspark`.** Testado com `pytest` no VSCode, loop de feedback
+  em milissegundos. Importável dentro do Databricks.
+- **`notebooks/`** — **orquestração Databricks**: ingestão Bronze (fetch
+  → build → `MERGE INTO`), validação. É onde Spark/Delta vivem. Roda no
+  workspace, não localmente.
+
+Implicações práticas:
+
+- **Não há `[spark]` extra nem PySpark como dependência.** PySpark +
+  Delta são providos pelo runtime Databricks. Editar um notebook no
+  VSCode não roda Spark local — roda no Databricks via Git Folder.
+- **Não escrever testes PySpark locais.** A validação de `MERGE`, CDF,
+  Liquid Clustering e Predictive Optimization acontece rodando os
+  notebooks no Databricks Free Edition (Definition of Done item 7).
+  PySpark local nunca foi um substituto fiel do Databricks Runtime.
+- **Padrão do notebook:** importa os helpers de `src/`, faz o fetch
+  async, monta DataFrame com `spark.createDataFrame`, roda `MERGE INTO`
+  via `spark.sql`. Eventos de dead-letter / ingestion-log são `dict`
+  escritos direto em Delta. Ver `notebooks/bronze/01_ingest_matches.py`.
+- **`MERGE INTO` com `INSERT` explícito:** colunas geradas
+  (`ingestion_date`) não aceitam `INSERT *`. Sempre listar as colunas
+  não-geradas: `INSERT (col, ...) VALUES (s.col, ...)`.
 
 ---
 
@@ -344,7 +365,7 @@ O passo 7 é o que separa "código que parece funcionar" de "código que funcion
 ## Roadmap de Sprints (rastrear progresso aqui)
 
 - [x] **Sprint 1: Foundation** — scaffolding do repo, Riot API client com rate limiter, Bronze DDL (com práticas Databricks modernas), smoke test, CLI, CI, docs/architecture.md + docs/data_dictionary.md, mypy strict passando. **Validado contra Databricks Free Edition em 2026-05-15** (ver `docs/sprint-1-validation.md`).
-- [ ] **Sprint 2: Robust Bronze** — ingestion incremental com MERGE, eventos de timeline, dead-letter queue, logs estruturados de ingestion em Delta, populate de `payload_hash`. **Status atual:** código completo e testado (RiotApiClient com dead-letter sink, bronze/records, BronzeWriter, Delta sinks, 3 runners, CLI commands `pull-*`, testes unitários + testes PySpark marcados); falta rodar o notebook `02_validate_ingestion.py` contra Databricks real (ver Definition of Done item 7).
+- [ ] **Sprint 2: Robust Bronze** — ingestion incremental com MERGE, eventos de timeline, dead-letter queue, logs estruturados de ingestion em Delta, populate de `payload_hash`. **Status atual:** após ADR 004 (simplificação Databricks-first), a ingestão Bronze vive em `notebooks/bronze/01_ingest_matches.py` e `02_ingest_leagues.py`; `src/` mantém só lógica pura (riot_client com dead-letter list, bronze/records, payload_hash). Falta rodar os notebooks contra Databricks real (Definition of Done item 7).
 - [ ] **Sprint 3: Silver** — modelo dimensional, SCD2 em dim_champion, framework de data quality, ADR 002 (SCD2) + ADR 003 (Clustering Strategy). **Bloqueado por:** validação do Sprint 2.
 - [ ] **Sprint 4: Gold + Analyses** — agregações de negócio, Liquid Clustering, as 10 queries SQL com comentário de negócio
 - [ ] **Sprint 5: Dashboard + Workflow** — Databricks SQL dashboard, scheduled job, monitoring/alerting básico
@@ -359,13 +380,13 @@ Ao iniciar um novo sprint, ler a seção relevante deste arquivo, os ADRs mais r
 
 (Atualizar esta seção conforme issues surgem.)
 
-- A coluna `payload_hash` no Bronze passou a ser populada na Sprint 2 (`bronze/records.py` calcula SHA-256 sobre o JSON canônico). A validar contra dados reais via `02_validate_ingestion.py`.
+- A coluna `payload_hash` no Bronze é populada por `bronze/records.py` (SHA-256 sobre o JSON canônico). A validar contra dados reais rodando `notebooks/bronze/01_ingest_matches.py`.
 - Sem testes de integration contra uma Riot API real (sandboxed) — confiando em mocks `respx`. Aceitável para Fase 1.
-- PySpark local não roda em Windows sem `winutils.exe` (HADOOP_HOME). Decisão: testes `@pytest.mark.spark` skipam no dev local Windows e rodam no job `spark-tests` do CI (Ubuntu) e no Databricks. Lógica pura é testada sem Spark.
-- `mypy --strict` passa zero erros e o CI agora enforça (sem `continue-on-error`).
+- `mypy --strict` passa zero erros e o CI enforça (sem `continue-on-error`).
 - Sprint 1 validada contra Databricks Free Edition real em 2026-05-15 — catalog, schemas, DDL Bronze, Liquid Clustering, column mapping, deletion vectors, CDF, generated columns e MERGE idempotency confirmados (ver `docs/sprint-1-validation.md`). Infra de plataforma de-riscada para Sprint 2.
-- Validação Sprint 2 (ingestion code path com partidas reais) contra Databricks real pendente — bloqueia Sprint 3.
-- DDL Bronze diverge de ADR 003 em 2 chaves de cluster: `raw_league_entries` (DDL tem `(ingestion_date, tier, platform)`, ADR tem `(ingestion_date, platform)`) e `ingestion_dead_letter` (DDL tem `(failed_at_date, error_class)`, ADR tem `(failed_at_date)`). Alinhar na Sprint 2 ao revisitar DDL pra MERGE.
+- Validação Sprint 2 (ingestion via notebooks contra partidas reais) contra Databricks real pendente — bloqueia Sprint 3.
+- DDL Bronze diverge de ADR 003 em 2 chaves de cluster: `raw_league_entries` (DDL tem `(ingestion_date, tier, platform)`, ADR tem `(ingestion_date, platform)`) e `ingestion_dead_letter` (DDL tem `(failed_at_date, error_class)`, ADR tem `(failed_at_date)`). Alinhar quando o DDL for revisitado.
+- ADR 004 simplificou a arquitetura de ingestão (Databricks-first): removidos bootstrap, runners, BronzeWriter, Delta sinks, Protocols e os comandos CLI `pull-*`. A orquestração Bronze vive em `notebooks/bronze/`. Os commits `36d2ea6`/`9fa2384`/`e53ff17`/`9b31775` da Sprint 2 descrevem código que foi removido — permanecem no histórico git; ADR 004 é o registro do porquê.
 
 ---
 

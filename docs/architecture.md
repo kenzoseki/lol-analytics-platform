@@ -20,20 +20,23 @@ For decisions and tradeoffs, see [`adr/`](adr/). For schema details, see
                                  │
                                  ▼
         ┌────────────────────────────────────────────────┐
-        │  Ingestion (Python 3.11, async httpx)          │
-        │  - RiotApiClient (retry, routing)              │
+        │  Bronze ingestion notebook (Databricks)        │
+        │  imports pure logic from src/lol_analytics:    │
+        │  - RiotApiClient (async httpx, retry, routing) │
         │  - RiotRateLimiter (multi-window token bucket) │
-        │  - Dead-letter queue on terminal failures      │
+        │  - records builders + payload_hash             │
+        │  then: spark.createDataFrame → MERGE INTO      │
         └────────────────┬───────────────────────────────┘
-                         │ append + MERGE on natural key
+                         │ MERGE on natural key
                          ▼
         ┌────────────────────────────────────────────────┐
-        │  BRONZE  (Delta Lake, partitioned by date)     │
+        │  BRONZE  (Delta Lake, Liquid Clustered)        │
         │  raw_matches | raw_match_timeline              │
         │  raw_league_entries | ingestion_dead_letter    │
+        │  ingestion_log                                 │
         │  Raw JSON preserved verbatim; no parsing here  │
         └────────────────┬───────────────────────────────┘
-                         │ PySpark transforms
+                         │ PySpark transforms (Databricks notebooks)
                          ▼
         ┌────────────────────────────────────────────────┐
         │  SILVER  (dimensional, conformed)              │
@@ -64,10 +67,14 @@ For decisions and tradeoffs, see [`adr/`](adr/). For schema details, see
   as a JSON string, plus lineage columns.
 - **Idempotency:** `MERGE INTO` on `(match_id, platform)`. Re-running a
   backfill is safe.
-- **Partitioning:** `ingestion_date` (daily). Cheap to backfill one day
-  at a time; supports time-travel queries ("what did we know on date X?").
+- **Layout:** Liquid Clustering (`CLUSTER BY`), not Hive partitioning —
+  see ADR 003. Supports time-travel queries ("what did we know on date
+  X?") via Delta history.
 - **Schema discipline:** stays minimal — identity, raw payload,
   payload hash, lineage. Field-level parsing is Silver's job, not Bronze's.
+- **Where it runs:** the ingestion is a Databricks notebook
+  (`notebooks/bronze/`) that imports pure logic from `src/` — see
+  ADR 004.
 
 ### Silver — dimensional model
 
@@ -141,9 +148,11 @@ sampling. Do not start Phase 2 work until Phase 1 ships end-to-end.
 
 | Concern | Path |
 |---|---|
-| Riot API client | [`src/lol_analytics/ingestion/riot_client.py`](../src/lol_analytics/ingestion/riot_client.py) |
-| Rate limiter | [`src/lol_analytics/ingestion/rate_limiter.py`](../src/lol_analytics/ingestion/rate_limiter.py) |
+| Riot API client (pure logic) | [`src/lol_analytics/ingestion/riot_client.py`](../src/lol_analytics/ingestion/riot_client.py) |
+| Rate limiter (pure logic) | [`src/lol_analytics/ingestion/rate_limiter.py`](../src/lol_analytics/ingestion/rate_limiter.py) |
+| Bronze record builders + hashing | [`src/lol_analytics/bronze/`](../src/lol_analytics/bronze/) |
 | Smoke test | [`src/lol_analytics/ingestion/smoke_test.py`](../src/lol_analytics/ingestion/smoke_test.py) |
-| CLI entry point | [`src/lol_analytics/ingestion/cli.py`](../src/lol_analytics/ingestion/cli.py) |
+| CLI entry point (`smoke-test`) | [`src/lol_analytics/ingestion/cli.py`](../src/lol_analytics/ingestion/cli.py) |
+| Bronze ingestion (orchestration) | [`notebooks/bronze/`](../notebooks/bronze/) |
 | Bronze DDL | [`sql/ddl/01_bronze.sql`](../sql/ddl/01_bronze.sql) |
 | Architecture decisions | [`docs/adr/`](adr/) |
